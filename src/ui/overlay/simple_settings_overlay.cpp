@@ -148,11 +148,12 @@ struct CategoryInfo {
   const char* name;
   const char* desc;
 };
-constexpr std::array<CategoryInfo, 7> kCategories = {{
+constexpr std::array<CategoryInfo, 8> kCategories = {{
     {"Video", "Display, resolution, framerate and renderer quality settings."},
     {"Controls", "Controller, mouse and keyboard input settings."},
     {"Audio", "Sound output settings."},
     {"Profile", "Local player profile and sign-in."},
+    {"Multiplayer", "Browse, host, join and leave multiplayer sessions."},
     {"Maps", "Install, select and load project-owned skate maps."},
     {"World", "Live sky, time-of-day and world-lighting controls."},
     {"System", "Game language, pending changes and closing the settings."},
@@ -974,12 +975,18 @@ struct SimpleSettingsDialog::NavIntents {
 SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem::path config_path,
                                            LoadProfilesCallback load_profiles,
                                            SaveProfileCallback save_profile,
+                                           LoadMultiplayerCallback load_multiplayer,
+                                           HostMultiplayerCallback host_multiplayer,
+                                           JoinMultiplayerCallback join_multiplayer,
+                                           LeaveMultiplayerCallback leave_multiplayer,
                                            LoadMapsCallback load_maps,
                                            ActivateMapCallback activate_map,
                                            OpenMapsFolderCallback open_maps_folder,
                                            LoadWorldLightingCallback load_world_lighting,
                                            UpdateWorldLightingCallback update_world_lighting,
                                            ResetWorldLightingCallback reset_world_lighting,
+                                           LoadUpdateStateCallback load_update_state,
+                                           StartUpdateCallback start_update,
                                            CloseSettingsCallback close_settings,
                                            CloseGameCallback close_game,
                                            RestartGameCallback restart_game,
@@ -988,19 +995,27 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
       config_path_(std::move(config_path)),
       load_profiles_(std::move(load_profiles)),
       save_profile_(std::move(save_profile)),
+      load_multiplayer_(std::move(load_multiplayer)),
+      host_multiplayer_(std::move(host_multiplayer)),
+      join_multiplayer_(std::move(join_multiplayer)),
+      leave_multiplayer_(std::move(leave_multiplayer)),
       load_maps_(std::move(load_maps)),
       activate_map_(std::move(activate_map)),
       open_maps_folder_(std::move(open_maps_folder)),
       load_world_lighting_(std::move(load_world_lighting)),
       update_world_lighting_(std::move(update_world_lighting)),
       reset_world_lighting_(std::move(reset_world_lighting)),
+      load_update_state_(std::move(load_update_state)),
+      start_update_(std::move(start_update)),
       close_settings_(std::move(close_settings)),
       close_game_(std::move(close_game)),
       restart_game_(std::move(restart_game)),
       poll_gamepad_(std::move(poll_gamepad)) {
   ReloadProfiles();
+  ReloadMultiplayer(true);
   ReloadMaps();
   ReloadWorldLighting();
+  ReloadUpdateState();
   LoadSettingsFromCvars();
   SetDrawActive(false);
 }
@@ -1011,8 +1026,10 @@ void SimpleSettingsDialog::Show() {
   visible_ = true;
   SetDrawActive(true);
   ReloadProfiles();
+  ReloadMultiplayer(false);
   ReloadMaps();
   ReloadWorldLighting();
+  ReloadUpdateState();
   LoadSettingsFromCvars();
   zone_ = FocusZone::kRail;
   rail_sel_ = category_;
@@ -1148,6 +1165,37 @@ void SimpleSettingsDialog::ReloadProfiles() {
   profile_signed_in_ = profiles_.profiles[profiles_.selected_index].signed_in;
 }
 
+void SimpleSettingsDialog::ReloadMultiplayer(bool refresh) {
+  std::string selected_id;
+  if (!multiplayer_.servers.empty()) {
+    const int selected = std::clamp(
+        multiplayer_.selected_server, 0,
+        static_cast<int>(multiplayer_.servers.size()) - 1);
+    selected_id = multiplayer_.servers[selected].id;
+  }
+  multiplayer_ = load_multiplayer_
+                     ? load_multiplayer_(refresh)
+                     : SimpleMultiplayerState{};
+  if (!selected_id.empty()) {
+    const auto found = std::find_if(
+        multiplayer_.servers.begin(), multiplayer_.servers.end(),
+        [&selected_id](const SimpleMultiplayerServerInfo& server) {
+          return server.id == selected_id;
+        });
+    if (found != multiplayer_.servers.end()) {
+      multiplayer_.selected_server = static_cast<int>(
+          std::distance(multiplayer_.servers.begin(), found));
+    }
+  }
+  if (multiplayer_.servers.empty()) {
+    multiplayer_.selected_server = 0;
+  } else {
+    multiplayer_.selected_server = std::clamp(
+        multiplayer_.selected_server, 0,
+        static_cast<int>(multiplayer_.servers.size()) - 1);
+  }
+}
+
 void SimpleSettingsDialog::ReloadMaps() {
   std::filesystem::path selected_path;
   if (!maps_.maps.empty()) {
@@ -1179,6 +1227,12 @@ void SimpleSettingsDialog::ReloadWorldLighting() {
   world_lighting_ = load_world_lighting_
                         ? load_world_lighting_()
                         : SimpleWorldLightingState{};
+}
+
+void SimpleSettingsDialog::ReloadUpdateState() {
+  update_state_ = load_update_state_
+                      ? load_update_state_()
+                      : SimpleUpdateState{};
 }
 
 void SimpleSettingsDialog::SaveVideo() {
@@ -2064,7 +2118,242 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       }
       break;
     }
-    case 4: {  // Maps
+    case 4: {  // Multiplayer
+      // Steam lobby creation, joins, membership changes and browser results
+      // complete asynchronously. Poll the transport-neutral snapshot while
+      // this page is open so the menu reflects them without being reopened.
+      ReloadMultiplayer(false);
+      header("Connection");
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Network Backend";
+        row.desc =
+            "Steam lobbies provide discovery and Steam Networking Messages "
+            "carry player replication. Local PC Test remains available when "
+            "the Steam development runtime is not installed.";
+        row.desc_extra =
+            (multiplayer_.backend_name.empty() ? "Unavailable"
+                                               : multiplayer_.backend_name) +
+            std::string("\n") + multiplayer_.steam_status;
+        row.enabled = false;
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Session Status";
+        row.desc = "Current multiplayer connection state.";
+        row.desc_extra = multiplayer_.status;
+        if (!multiplayer_.session_name.empty()) {
+          row.desc_extra +=
+              (row.desc_extra.empty() ? "" : "\n") +
+              std::string("Session: ") + multiplayer_.session_name;
+        }
+        if (!multiplayer_.map_name.empty()) {
+          row.desc_extra +=
+              (row.desc_extra.empty() ? "" : "\n") +
+              std::string("Map: ") + multiplayer_.map_name;
+        }
+        if (multiplayer_.max_players > 0) {
+          row.desc_extra +=
+              (row.desc_extra.empty() ? "" : "\n") +
+              std::string("Players: ") +
+              std::to_string(multiplayer_.players) + " / " +
+              std::to_string(multiplayer_.max_players);
+        }
+        row.enabled = false;
+        rows.push_back(std::move(row));
+      }
+      const bool connected =
+          multiplayer_.phase == SimpleMultiplayerPhase::kHosting ||
+          multiplayer_.phase == SimpleMultiplayerPhase::kConnected;
+      if (connected) {
+        {
+          RowSpec row;
+          row.kind = RowSpec::kAction;
+          row.label = multiplayer_.is_host ? "Stop Hosting"
+                                           : "Leave Game";
+          row.desc =
+              multiplayer_.is_host
+                  ? "Close this multiplayer session and return to offline play."
+                  : "Disconnect from the current session and return to offline play.";
+          row.danger = true;
+          row.action = [this] {
+            if (leave_multiplayer_) {
+              leave_multiplayer_();
+            }
+            ReloadMultiplayer(true);
+          };
+          rows.push_back(std::move(row));
+        }
+        break;
+      }
+
+      header("Server Browser");
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Server";
+        row.desc =
+            "Choose a discovered Custom Engine Layer session. Steam results "
+            "are filtered so unrelated Spacewar test lobbies are hidden.";
+        if (multiplayer_.servers.empty()) {
+          row.options = {"No servers found"};
+          row.enabled = false;
+        } else {
+          for (const auto& server : multiplayer_.servers) {
+            std::string label =
+                server.name + "  [" + std::to_string(server.players) + "/" +
+                std::to_string(server.max_players) + "]";
+            if (server.passworded) {
+              label += "  [Password]";
+            }
+            if (!server.compatible) {
+              label += "  [Unavailable]";
+            }
+            row.options.push_back(std::move(label));
+          }
+          row.index = &multiplayer_.selected_server;
+        }
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kText;
+        row.label = "Join Password";
+        row.desc =
+            "Password for the selected server. Leave blank for open sessions.";
+        row.text_buf = multiplayer_join_password_buf_;
+        row.text_buf_size = sizeof(multiplayer_join_password_buf_);
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Join Selected Server";
+        row.desc = "Join the selected session on the currently loaded map.";
+        const SimpleMultiplayerServerInfo* selected = nullptr;
+        if (!multiplayer_.servers.empty()) {
+          multiplayer_.selected_server = std::clamp(
+              multiplayer_.selected_server, 0,
+              static_cast<int>(multiplayer_.servers.size()) - 1);
+          selected = &multiplayer_.servers[multiplayer_.selected_server];
+        }
+        row.enabled = selected != nullptr && selected->compatible;
+        if (selected != nullptr) {
+          row.desc_extra =
+              "Host: " + selected->host_name + "\nMap: " +
+              selected->map_name;
+          if (!selected->compatibility_note.empty()) {
+            row.desc_extra += "\n" + selected->compatibility_note;
+          }
+        }
+        row.action = [this] {
+          if (multiplayer_.servers.empty() || !join_multiplayer_) {
+            return;
+          }
+          multiplayer_.selected_server = std::clamp(
+              multiplayer_.selected_server, 0,
+              static_cast<int>(multiplayer_.servers.size()) - 1);
+          join_multiplayer_(
+              multiplayer_.servers[multiplayer_.selected_server].id,
+              multiplayer_join_password_buf_);
+          ReloadMultiplayer(true);
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Refresh Server List";
+        row.desc = "Search for newly hosted multiplayer sessions.";
+        row.action = [this] { ReloadMultiplayer(true); };
+        rows.push_back(std::move(row));
+      }
+
+      header("Host Game");
+      {
+        RowSpec row;
+        row.kind = RowSpec::kText;
+        row.label = "Server Name";
+        row.desc = "Name shown to players in the server browser.";
+        row.text_buf = multiplayer_server_name_buf_;
+        row.text_buf_size = sizeof(multiplayer_server_name_buf_);
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kSlider;
+        row.label = "Max Players";
+        row.desc =
+            "Maximum players allowed in the session. High player counts are "
+            "experimental and will need further bandwidth optimisation.";
+        row.value = &multiplayer_max_players_;
+        row.min = 2.0f;
+        row.max = 100.0f;
+        row.step = 1.0f;
+        row.fmt = "%.0f";
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Privacy";
+        row.desc =
+            "Public, friends-only and invite-only become Steam lobby types "
+            "when the Steam backend is available.";
+        row.options = {"Public", "Friends Only", "Invite Only"};
+        row.index = &multiplayer_privacy_index_;
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Late Joining";
+        row.desc = "Allow players to join after the session has started.";
+        row.options = {"Disabled", "Enabled"};
+        row.flag = &multiplayer_late_join_;
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kText;
+        row.label = "Host Password";
+        row.desc =
+            "Optional password. Leave blank to host an open session.";
+        row.text_buf = multiplayer_host_password_buf_;
+        row.text_buf_size = sizeof(multiplayer_host_password_buf_);
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Host Game";
+        row.desc =
+            "Start a session on the active map and publish it to the server "
+            "browser.";
+        row.action = [this] {
+          if (!host_multiplayer_) {
+            return;
+          }
+          SimpleMultiplayerHostSettings settings;
+          settings.server_name = multiplayer_server_name_buf_;
+          settings.password = multiplayer_host_password_buf_;
+          settings.max_players = std::clamp(
+              static_cast<int>(std::lround(multiplayer_max_players_)), 2,
+              100);
+          settings.privacy = static_cast<SimpleMultiplayerPrivacy>(
+              std::clamp(multiplayer_privacy_index_, 0, 2));
+          settings.allow_late_join = multiplayer_late_join_;
+          host_multiplayer_(settings);
+          ReloadMultiplayer(true);
+        };
+        rows.push_back(std::move(row));
+      }
+      break;
+    }
+    case 5: {  // Maps
       {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -2078,7 +2367,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         } else {
           for (const SimpleMapInfo& map : maps_.maps) {
             row.options.push_back(
-                map.name + (map.active ? "  [Active]" : ""));
+                map.name + (map.active ? "  [Active]" : "") +
+                (!map.compatible ? "  [Update Required]" : ""));
           }
           row.index = &maps_.selected_index;
           row.on_enum_change = [this](int) { map_status_.clear(); };
@@ -2093,9 +2383,18 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
             "Load the selected map. The game session restarts automatically "
             "so every renderer, collision, grind and physics resource is "
             "rebuilt cleanly for the new world.";
-        row.enabled = !maps_.maps.empty();
+        const SimpleMapInfo* selected_map = nullptr;
+        if (!maps_.maps.empty()) {
+          maps_.selected_index = std::clamp(
+              maps_.selected_index, 0,
+              static_cast<int>(maps_.maps.size()) - 1);
+          selected_map = &maps_.maps[maps_.selected_index];
+        }
+        row.enabled = selected_map && selected_map->compatible;
         if (!map_status_.empty()) {
           row.desc_extra = map_status_;
+        } else if (selected_map && !selected_map->compatible) {
+          row.desc_extra = selected_map->compatibility_note;
         } else if (!maps_.active_name.empty()) {
           row.desc_extra = "Currently active: " + maps_.active_name;
         }
@@ -2151,7 +2450,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       }
       break;
     }
-    case 5: {  // World
+    case 6: {  // World
       const bool enabled = world_lighting_.available;
       auto update = [this](SimpleWorldLightingField field, float value) {
         if (update_world_lighting_) {
@@ -2393,7 +2692,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       }
       break;
     }
-    case 6: {  // System
+    case 7: {  // System
+      ReloadUpdateState();
       if (HasCvar("user_language")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -2410,6 +2710,48 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
               std::clamp(int(CvarDefaultDouble("user_language", 1.0)), 1,
                          static_cast<int>(kLanguageLabels.size())) -
               1;
+        };
+        rows.push_back(std::move(row));
+      }
+      header("Custom Engine Layer");
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Update Custom Engine Layer";
+        row.desc =
+            "Check, download, verify, install, and restart into the newest "
+            "official release. Game data, saves, settings, and custom maps "
+            "are preserved.";
+        row.desc_extra = update_state_.status;
+        if (!update_state_.current_version.empty()) {
+          row.desc_extra +=
+              (row.desc_extra.empty() ? "" : "\n") +
+              std::string("Installed: ") + update_state_.current_version;
+        }
+        if (!update_state_.latest_version.empty() &&
+            update_state_.latest_version != update_state_.current_version) {
+          row.desc_extra +=
+              (row.desc_extra.empty() ? "" : "\n") +
+              std::string("Available: ") + update_state_.latest_version;
+        }
+        if (update_state_.phase == SimpleUpdatePhase::kDownloading &&
+            update_state_.progress > 0.0f) {
+          const int percent =
+              std::clamp(static_cast<int>(update_state_.progress * 100.0f),
+                         0, 100);
+          row.desc_extra +=
+              (row.desc_extra.empty() ? "" : "\n") +
+              std::string("Progress: ") + std::to_string(percent) + "%";
+        }
+        row.enabled =
+            update_state_.phase != SimpleUpdatePhase::kChecking &&
+            update_state_.phase != SimpleUpdatePhase::kDownloading &&
+            update_state_.phase != SimpleUpdatePhase::kInstalling &&
+            update_state_.phase != SimpleUpdatePhase::kUnsupported;
+        row.action = [this] {
+          if (start_update_) {
+            start_update_();
+          }
         };
         rows.push_back(std::move(row));
       }
