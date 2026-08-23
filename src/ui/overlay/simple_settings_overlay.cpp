@@ -2686,6 +2686,23 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       {
         RowSpec row;
         row.kind = RowSpec::kEnum;
+        row.label = "Dynamic Lighting";
+        row.desc =
+            "Enable the moving sun, moon, ambient fill and their world "
+            "shadows. Off keeps the clock, sky and baked map lighting.";
+        row.options = {"Off", "On"};
+        row.flag = &world_lighting_.dynamic_lighting_enabled;
+        row.enabled = enabled;
+        row.on_enum_change = [update](int value) {
+          update(
+              SimpleWorldLightingField::kDynamicLightingEnabled,
+              float(value));
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
         row.label = "Day / Night Cycle";
         row.desc =
             "Run or pause the active map's celestial clock. Pausing holds "

@@ -113,12 +113,14 @@ enum class SimpleWorldLightingField {
   kMoonIntensity,
   kDayAmbient,
   kNightAmbient,
+  kDynamicLightingEnabled,
 };
 
 struct SimpleWorldLightingState {
   bool available = false;
   bool paused = false;
   bool ping_pong = false;
+  bool dynamic_lighting_enabled = true;
   float time_of_day_hours = 0.0f;
   float cycle_duration_seconds = 0.0f;
   float start_hour = 0.0f;
