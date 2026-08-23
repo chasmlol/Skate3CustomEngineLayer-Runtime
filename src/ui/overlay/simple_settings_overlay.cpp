@@ -2689,7 +2689,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.label = "Dynamic Lighting";
         row.desc =
             "Enable the moving sun, moon, ambient fill and their world "
-            "shadows. Off keeps the clock, sky and baked map lighting.";
+            "shadows. Off keeps the clock and sky, and presents imported "
+            "baked maps through the retail lighting curve.";
         row.options = {"Off", "On"};
         row.flag = &world_lighting_.dynamic_lighting_enabled;
         row.enabled = enabled;
