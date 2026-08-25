@@ -98,6 +98,9 @@ class D3D12DescriptorHeapPool {
   // for more information.
   uint64_t current_heap_index_ = 0;
   uint32_t current_page_used_ = 0;
+  // Prevent a persistent device/driver allocation failure from producing an
+  // unbounded per-draw log storm.
+  bool heap_creation_failure_reported_ = false;
 };
 
 }  // namespace rex::ui::d3d12

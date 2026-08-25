@@ -14,10 +14,10 @@
 #include <fstream>
 #include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -26,6 +26,7 @@
 
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/logging.h>
+#include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
@@ -406,6 +407,8 @@ class NrCmdD3D12 : public nrhi::Cmd {
   void ResetFrameState() {
     std::memset(last_table_views_, 0, sizeof(last_table_views_));
     std::memset(last_table_counts_, 0, sizeof(last_table_counts_));
+    table_heap_index_ =
+        ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
   }
 
   // Frame begin only (never on root-signature changes): each frame gets a
@@ -431,6 +434,11 @@ class NrCmdD3D12 : public nrhi::Cmd {
   NrTextureViewD3D12* last_table_views_[nrhi::kMaxBindingParams]
                                        [nrhi::kMaxTextureTableSize] = {};
   uint32_t last_table_counts_[nrhi::kMaxBindingParams] = {};
+  // A descriptor table handle is valid only for the heap it came from.
+  // Invalidating this at frame/root-signature boundaries forces the first
+  // texture update to bind a heap and repopulate every live table.
+  uint64_t table_heap_index_ =
+      ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
 };
 
 class NrDeviceD3D12 : public nrhi::Device {
@@ -444,10 +452,6 @@ class NrDeviceD3D12 : public nrhi::Device {
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.NumDescriptors = kStagingViews;
     device_->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&staging_heap_));
-    heap_desc.NumDescriptors = kShaderVisibleViews;
-    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    device_->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&srv_heap_));
-    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     heap_desc.NumDescriptors = kRtvSlots;
     device_->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap_));
@@ -460,9 +464,12 @@ class NrDeviceD3D12 : public nrhi::Device {
     rtv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     dsv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     staging_slots_.capacity = kStagingViews;
-    srv_slots_.capacity = kShaderVisibleViews;
     rtv_slots_.capacity = kRtvSlots;
     dsv_slots_.capacity = kDsvSlots;
+    srv_heap_pool_ =
+        std::make_unique<ui::d3d12::D3D12DescriptorHeapPool>(
+            device_, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            kShaderVisibleViewPageSize);
     // Resolve the device's adapter for the periodic VRAM telemetry
     // (process-local usage vs the OS-granted budget, the same numbers the
     // OS shows per process). Optional: the log line is skipped when any
@@ -503,7 +510,6 @@ class NrDeviceD3D12 : public nrhi::Device {
       delete entry.second;
     }
     if (staging_heap_) staging_heap_->Release();
-    if (srv_heap_) srv_heap_->Release();
     if (rtv_heap_) rtv_heap_->Release();
     if (dsv_heap_) dsv_heap_->Release();
   }
@@ -653,31 +659,16 @@ class NrDeviceD3D12 : public nrhi::Device {
 
   void DestroyDeferred(nrhi::TextureView* view) override {
     if (view == nullptr) return;
-    // Destruction is batched: the view object stays allocated (so its
-    // address cannot be reused while stale binding-cache keys still hold it)
-    // and FlushDissolvedViews sweeps the binding cache ONCE per frame for
-    // the whole batch instead of once per destroyed view.
+    // Destruction is batched until frame maintenance so staging descriptors
+    // are retired against the submission that can still reference them.
     dissolved_views_.push_back(static_cast<NrTextureViewD3D12*>(view));
   }
 
-  // Render thread, once per frame (and at device destruction): retire every
-  // shader-visible binding referencing a view destroyed since the last
-  // flush, then retire the views themselves.
+  // Render thread, once per frame (and at device destruction).
   void FlushDissolvedViews() {
     if (dissolved_views_.empty()) return;
-    std::unordered_set<const NrTextureViewD3D12*> dissolved(dissolved_views_.begin(),
-                                                            dissolved_views_.end());
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t submission = cp_->GetCurrentSubmission();
-    std::erase_if(bindings_, [&](auto& entry) {
-      for (uint32_t i = 0; i < entry.first.count; ++i) {
-        if (dissolved.count(entry.first.views[i]) != 0) {
-          srv_slots_.Retire(entry.second.first_slot, entry.second.count, submission);
-          return true;
-        }
-      }
-      return false;
-    });
     for (NrTextureViewD3D12* v : dissolved_views_) {
       staging_slots_.Retire(v->staging_slot, 1, submission);
       delete v;
@@ -963,6 +954,9 @@ class NrDeviceD3D12 : public nrhi::Device {
       released = DrainRetired(cp_->GetCompletedSubmission());
       backlog = retired_.size();
     }
+    // Shader-visible tables are transient. Full pages are retained until the
+    // GPU submission that used them completes, then recycled by the pool.
+    srv_heap_pool_->Reclaim(cp_->GetCompletedSubmission());
     // Periodic VRAM budget line (mirrors the Vulkan backend's): local =
     // dedicated VRAM this process holds, the number that ratchets when a
     // cache retains superseded content across map changes.
@@ -1050,16 +1044,6 @@ class NrDeviceD3D12 : public nrhi::Device {
     handle.ptr += size_t(slot) * view_size_;
     return handle;
   }
-  D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(uint32_t slot) const {
-    D3D12_CPU_DESCRIPTOR_HANDLE handle = srv_heap_->GetCPUDescriptorHandleForHeapStart();
-    handle.ptr += size_t(slot) * view_size_;
-    return handle;
-  }
-  D3D12_GPU_DESCRIPTOR_HANDLE SrvGpuHandle(uint32_t slot) const {
-    D3D12_GPU_DESCRIPTOR_HANDLE handle = srv_heap_->GetGPUDescriptorHandleForHeapStart();
-    handle.ptr += size_t(slot) * view_size_;
-    return handle;
-  }
   D3D12_CPU_DESCRIPTOR_HANDLE RtvHandle(uint32_t slot) const {
     D3D12_CPU_DESCRIPTOR_HANDLE handle = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     handle.ptr += size_t(slot) * rtv_size_;
@@ -1071,48 +1055,60 @@ class NrDeviceD3D12 : public nrhi::Device {
     return handle;
   }
 
-  // Shader-visible binding for an ordered view tuple: consecutive slots
-  // holding copies of the staging descriptors, cached and retired when a
-  // participating view is destroyed. Render thread only.
-  bool GetBinding(NrTextureViewD3D12* const* views, uint32_t count,
-                  D3D12_GPU_DESCRIPTOR_HANDLE* gpu_out) {
-    if (count == 0 || count > nrhi::kMaxTextureTableSize || views[0] == nullptr) {
+  // Allocate transient shader-visible descriptors. The pool grows by pages
+  // and recycles them only after their GPU submission completes. When a page
+  // switch is required, count_for_full_update reserves enough contiguous
+  // space for every currently live root table.
+  bool RequestTextureDescriptors(
+      uint64_t previous_heap_index, uint32_t count_for_partial_update,
+      uint32_t count_for_full_update, uint64_t* heap_index_out,
+      ID3D12DescriptorHeap** heap_out,
+      D3D12_CPU_DESCRIPTOR_HANDLE* cpu_out,
+      D3D12_GPU_DESCRIPTOR_HANDLE* gpu_out) {
+    uint32_t descriptor_index = 0;
+    const uint64_t heap_index = srv_heap_pool_->Request(
+        cp_->GetCurrentSubmission(), previous_heap_index,
+        count_for_partial_update, count_for_full_update, descriptor_index);
+    if (heap_index ==
+        ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid) {
       return false;
     }
-    BindingKey key{};
+    *heap_index_out = heap_index;
+    *heap_out = srv_heap_pool_->GetLastRequestHeap();
+    *cpu_out = srv_heap_pool_->GetLastRequestHeapCPUStart();
+    cpu_out->ptr += size_t(descriptor_index) * view_size_;
+    *gpu_out = srv_heap_pool_->GetLastRequestHeapGPUStart();
+    gpu_out->ptr += size_t(descriptor_index) * view_size_;
+    return true;
+  }
+
+  bool CopyTextureDescriptors(
+      NrTextureViewD3D12* const* views, uint32_t count,
+      D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+    if (count == 0 || count > nrhi::kMaxTextureTableSize) {
+      return false;
+    }
     for (uint32_t i = 0; i < count; ++i) {
-      key.views[i] = views[i];
-    }
-    key.count = count;
-    auto it = bindings_.find(key);
-    if (it == bindings_.end()) {
-      uint32_t first_slot;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!srv_slots_.Alloc(count, &first_slot)) {
-          REXLOG_ERROR("nrhi-d3d12: shader-visible view heap exhausted");
-          return false;
-        }
+      if (views[i] == nullptr) {
+        return false;
       }
-      for (uint32_t i = 0; i < count; ++i) {
-        if (views[i] == nullptr) continue;
-        device_->CopyDescriptorsSimple(1, SrvCpuHandle(first_slot + i),
-                                       StagingHandle(views[i]->staging_slot),
-                                       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-      }
-      it = bindings_.emplace(key, Binding{first_slot, count}).first;
+      device_->CopyDescriptorsSimple(
+          1, destination, StagingHandle(views[i]->staging_slot),
+          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      destination.ptr += view_size_;
     }
-    *gpu_out = SrvGpuHandle(it->second.first_slot);
     return true;
   }
 
   D3D12CommandProcessor* cp() { return cp_; }
-  ID3D12DescriptorHeap* srv_heap() { return srv_heap_; }
+  uint32_t view_size() const { return view_size_; }
   D3D12_RESOURCE_STATES guest_output_state() const { return guest_output_state_; }
 
  private:
   static constexpr uint32_t kStagingViews = 16384;
-  static constexpr uint32_t kShaderVisibleViews = 32768;
+  // A page, not a global capacity. New pages are allocated on demand and old
+  // pages are recycled after GPU completion.
+  static constexpr uint32_t kShaderVisibleViewPageSize = 32768;
   static constexpr uint32_t kRtvSlots = 64;
   static constexpr uint32_t kDsvSlots = 8;
 
@@ -1121,22 +1117,6 @@ class NrDeviceD3D12 : public nrhi::Device {
     ID3D12PipelineState* pso;
     uint64_t submission;
   };
-  struct BindingKey {
-    NrTextureViewD3D12* views[nrhi::kMaxTextureTableSize];
-    uint32_t count;
-    bool operator<(const BindingKey& other) const {
-      if (count != other.count) return count < other.count;
-      for (uint32_t i = 0; i < count; ++i) {
-        if (views[i] != other.views[i]) return views[i] < other.views[i];
-      }
-      return false;
-    }
-  };
-  struct Binding {
-    uint32_t first_slot;
-    uint32_t count;
-  };
-
   // Hands GPU-completed retirements to the release thread. Committed
   // resource Release calls are kernel-priced (~150 us each measured); a
   // sustained eviction feed released on the render thread was a whole-frame
@@ -1158,7 +1138,6 @@ class NrDeviceD3D12 : public nrhi::Device {
       release_cv_.notify_one();
     }
     staging_slots_.Drain(completed);
-    srv_slots_.Drain(completed);
     rtv_slots_.Drain(completed);
     dsv_slots_.Drain(completed);
     return moved;
@@ -1203,15 +1182,15 @@ class NrDeviceD3D12 : public nrhi::Device {
   NrCmdD3D12 cmd_;
 
   ID3D12DescriptorHeap* staging_heap_ = nullptr;
-  ID3D12DescriptorHeap* srv_heap_ = nullptr;
   ID3D12DescriptorHeap* rtv_heap_ = nullptr;
   ID3D12DescriptorHeap* dsv_heap_ = nullptr;
   uint32_t view_size_ = 0;
   uint32_t rtv_size_ = 0;
   uint32_t dsv_size_ = 0;
 
-  // mutex_ guards the slot allocators and retired_ (creation and deferred
-  // destruction are thread-safe); bindings_ is render-thread-only.
+  // mutex_ guards the fixed slot allocators and retired_ (creation and
+  // deferred destruction are thread-safe). The shader-visible heap pool is
+  // render-thread-only.
   // release_mutex_ guards release_queue_/release_exit_ and nests inside
   // mutex_ (the release thread never takes mutex_).
   std::mutex mutex_;
@@ -1221,14 +1200,11 @@ class NrDeviceD3D12 : public nrhi::Device {
   std::vector<RetiredObject> release_queue_;
   bool release_exit_ = false;
   SlotAllocator staging_slots_;
-  SlotAllocator srv_slots_;
   SlotAllocator rtv_slots_;
   SlotAllocator dsv_slots_;
+  std::unique_ptr<ui::d3d12::D3D12DescriptorHeapPool> srv_heap_pool_;
   std::vector<RetiredObject> retired_;
-  std::map<BindingKey, Binding> bindings_;
   // Views destroyed since the last FlushDissolvedViews (render thread only).
-  // The objects stay allocated until the flush so stale binding-cache keys
-  // can never collide with a newly created view at the same address.
   std::vector<NrTextureViewD3D12*> dissolved_views_;
   std::map<ID3D12Resource*, NrTextureD3D12*> guest_outputs_;
   D3D12_RESOURCE_STATES guest_output_state_ = D3D12_RESOURCE_STATE_COMMON;
@@ -1237,7 +1213,6 @@ class NrDeviceD3D12 : public nrhi::Device {
 void NrCmdD3D12::SetBindingLayout(nrhi::BindingLayout* layout) {
   auto* l = static_cast<NrBindingLayoutD3D12*>(layout);
   DeferredCommandList& list = device->cp()->GetDeferredCommandList();
-  list.SetDescriptorHeaps(device->srv_heap(), nullptr);
   list.D3DSetGraphicsRootSignature(l->root_signature);
   // Root-signature semantics: all bindings reset.
   ResetFrameState();
@@ -1266,17 +1241,82 @@ void NrCmdD3D12::SetBufferSrv(uint32_t param, nrhi::Buffer* buffer, uint64_t off
 
 void NrCmdD3D12::BindTextureTable(uint32_t param, NrTextureViewD3D12* const* views,
                                   uint32_t count) {
-  if (param >= nrhi::kMaxBindingParams) return;
+  if (param >= nrhi::kMaxBindingParams || count == 0 ||
+      count > nrhi::kMaxTextureTableSize) {
+    return;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    if (views[i] == nullptr) {
+      return;
+    }
+  }
   if (count == last_table_counts_[param] &&
       std::memcmp(last_table_views_[param], views, count * sizeof(views[0])) == 0) {
     return;  // identical tuple already bound on this root param
   }
-  D3D12_GPU_DESCRIPTOR_HANDLE handle;
-  if (device->GetBinding(views, count, &handle)) {
-    device->cp()->GetDeferredCommandList().D3DSetGraphicsRootDescriptorTable(param, handle);
-    std::memcpy(last_table_views_[param], views, count * sizeof(views[0]));
-    last_table_counts_[param] = count;
+
+  // Update the CPU-side table state first so a heap switch can rebuild every
+  // root table, including this changed one, in one contiguous allocation.
+  NrTextureViewD3D12* previous_views[nrhi::kMaxTextureTableSize] = {};
+  const uint32_t previous_count = last_table_counts_[param];
+  std::memcpy(previous_views, last_table_views_[param],
+              sizeof(previous_views));
+  std::memcpy(last_table_views_[param], views,
+              count * sizeof(views[0]));
+  if (count < nrhi::kMaxTextureTableSize) {
+    std::memset(last_table_views_[param] + count, 0,
+                (nrhi::kMaxTextureTableSize - count) *
+                    sizeof(last_table_views_[param][0]));
   }
+  last_table_counts_[param] = count;
+
+  uint32_t full_count = 0;
+  for (uint32_t table_param = 0;
+       table_param < nrhi::kMaxBindingParams; ++table_param) {
+    full_count += last_table_counts_[table_param];
+  }
+
+  uint64_t heap_index;
+  ID3D12DescriptorHeap* heap;
+  D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle;
+  if (!device->RequestTextureDescriptors(
+          table_heap_index_, count, full_count, &heap_index, &heap,
+          &cpu_handle, &gpu_handle)) {
+    // Keep the command wrapper's state consistent if heap creation fails.
+    std::memcpy(last_table_views_[param], previous_views,
+                sizeof(previous_views));
+    last_table_counts_[param] = previous_count;
+    return;
+  }
+
+  DeferredCommandList& list = device->cp()->GetDeferredCommandList();
+  if (heap_index != table_heap_index_) {
+    // Switching a descriptor heap invalidates every root descriptor table.
+    // The pool reserved full_count slots, so rebuild all tables atomically.
+    list.SetDescriptorHeaps(heap, nullptr);
+    for (uint32_t table_param = 0;
+         table_param < nrhi::kMaxBindingParams; ++table_param) {
+      const uint32_t table_count = last_table_counts_[table_param];
+      if (table_count == 0) {
+        continue;
+      }
+      if (!device->CopyTextureDescriptors(
+              last_table_views_[table_param], table_count, cpu_handle)) {
+        return;
+      }
+      list.D3DSetGraphicsRootDescriptorTable(table_param, gpu_handle);
+      cpu_handle.ptr += size_t(table_count) * device->view_size();
+      gpu_handle.ptr += size_t(table_count) * device->view_size();
+    }
+  } else {
+    if (!device->CopyTextureDescriptors(
+            last_table_views_[param], count, cpu_handle)) {
+      return;
+    }
+    list.D3DSetGraphicsRootDescriptorTable(param, gpu_handle);
+  }
+  table_heap_index_ = heap_index;
 }
 
 void NrCmdD3D12::SetTexture(uint32_t param, nrhi::TextureView* view) {
