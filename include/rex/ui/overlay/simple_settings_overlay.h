@@ -13,6 +13,7 @@
 
 #include <rex/ui/graphics_device_list.h>
 #include <rex/ui/imgui_dialog.h>
+#include <rex/ui/overlay/simple_multiplayer_availability.h>
 
 namespace rex::ui {
 

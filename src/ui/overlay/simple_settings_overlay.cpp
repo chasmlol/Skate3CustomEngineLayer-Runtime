@@ -166,6 +166,7 @@ constexpr std::array<CategoryInfo, 8> kCategories = {{
     {"World", "Live sky, time-of-day and world-lighting controls."},
     {"System", "Game language, pending changes and closing the settings."},
 }};
+constexpr int kMultiplayerCategory = 4;
 
 // Navigation repeat pacing (seconds).
 constexpr float kRepeatDelay = 0.42f;
@@ -2187,15 +2188,19 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       // complete asynchronously. Poll the transport-neutral snapshot while
       // this page is open so the menu reflects them without being reopened.
       ReloadMultiplayer(false);
+      const bool multiplayer_enabled =
+          SimpleMultiplayerControlsEnabled(multiplayer_.steam_available);
       header("Connection");
       {
         RowSpec row;
         row.kind = RowSpec::kAction;
-        row.label = "Network Backend";
-        row.desc =
-            "Steam lobbies provide discovery and Steam Networking Messages "
-            "carry player replication. Local PC Test remains available when "
-            "the Steam development runtime is not installed.";
+        row.label = multiplayer_enabled ? "Network Backend"
+                                        : "Start Steam to use multiplayer";
+        row.desc = multiplayer_enabled
+                       ? "Steam lobbies provide discovery and Steam "
+                         "Networking Messages carry player replication."
+                       : "Offline and single-player play remain fully "
+                         "available while Steam is unavailable.";
         row.desc_extra =
             (multiplayer_.backend_name.empty() ? "Unavailable"
                                                : multiplayer_.backend_name) +
@@ -2392,8 +2397,9 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         }
       }
       const bool connected =
-          multiplayer_.phase == SimpleMultiplayerPhase::kHosting ||
-          multiplayer_.phase == SimpleMultiplayerPhase::kConnected;
+          multiplayer_enabled &&
+          (multiplayer_.phase == SimpleMultiplayerPhase::kHosting ||
+           multiplayer_.phase == SimpleMultiplayerPhase::kConnected);
       if (connected) {
         {
           RowSpec row;
@@ -2576,6 +2582,11 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
           ReloadMultiplayer(true);
         };
         rows.push_back(std::move(row));
+      }
+      if (!multiplayer_enabled) {
+        for (RowSpec& row : rows) {
+          row.enabled = false;
+        }
       }
       break;
     }
@@ -3271,6 +3282,13 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   std::vector<RowSpec> rows;
   BuildRows(rows, category_);
+  const bool multiplayer_controls_enabled =
+      SimpleMultiplayerControlsEnabled(multiplayer_.steam_available);
+  const auto category_available =
+      [multiplayer_controls_enabled](int category) {
+        return category != kMultiplayerCategory ||
+               multiplayer_controls_enabled;
+      };
 
   // Selectable row indices (headers and disabled rows are skipped by nav).
   std::vector<int> selectable;
@@ -3535,6 +3553,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   for (int i = 0; i < category_count; ++i) {
     float y0 = columns_y + i * (rail_item_h + row_gap);
     float y1 = y0 + rail_item_h;
+    const bool available = category_available(i);
     bool is_current = category_ == i;
     bool hovered = mouse_in(rail_x, y0, rail_x + rail_w, y1);
     if (hovered && clicked) {
@@ -3561,7 +3580,8 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     if (!(rail_focused && fill_arrived)) {
       ImU32 bg = (is_current && !rail_focused)
                      ? kColSelFill
-                     : (hovered ? kColRailPanelHover : kColRailPanel);
+                     : (hovered && available ? kColRailPanelHover
+                                             : kColRailPanel);
       dl->AddRectFilled(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1), bg, 0.0f);
       dl->AddRect(ImVec2(rail_x, y0), ImVec2(rail_x + rail_w, y1), kColRailBorder, 0.0f);
     }
@@ -3584,12 +3604,17 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   }
   for (int i = 0; i < category_count; ++i) {
     float y0 = columns_y + i * (rail_item_h + row_gap);
+    const bool available = category_available(i);
     bool is_current = category_ == i;
     // Focused text styling waits for the sliding fill to mostly cover the
     // item (same anti-vanish rule as the content rows).
     bool focused = is_current && zone_ == FocusZone::kRail && rail_sel_ == i &&
                    rail_anim_y_ >= 0.0f && std::abs(rail_anim_y_ - y0) < rail_item_h * 0.5f;
-    ImU32 text_col = focused ? kColSelText : (is_current ? kColText : kColTextDim);
+    ImU32 text_col =
+        available
+            ? (focused ? kColSelText
+                       : (is_current ? kColText : kColTextDim))
+            : kColTextFaint;
     AddTextVCentered(dl, bold, label_size, rail_x + 20.0f * s,
                      y0 + rail_item_h * 0.5f, text_col, kCategories[i].name);
     if (is_current && zone_ == FocusZone::kContent) {
@@ -3759,10 +3784,15 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     if (row.kind == RowSpec::kHeader) {
       // Section header: solid accent bar spanning the content
       // column, dark bold text, label column-aligned with the row labels.
-      dl->AddRectFilled(ImVec2(content_x, y0), ImVec2(content_x + content_w, y1), kColAccent,
-                        0.0f);
-      AddTextVCentered(dl, bold_ol, label_size, content_x + 18.0f * s, cy, kColAccentDark,
-                       row.label);
+      const ImU32 header_fill =
+          row.enabled ? kColAccent : IM_COL32(87, 94, 94, 210);
+      const ImU32 header_text =
+          row.enabled ? kColAccentDark : kColTextFaint;
+      dl->AddRectFilled(ImVec2(content_x, y0),
+                        ImVec2(content_x + content_w, y1),
+                        header_fill, 0.0f);
+      AddTextVCentered(dl, bold_ol, label_size, content_x + 18.0f * s,
+                       cy, header_text, row.label);
       return;
     }
 
@@ -3978,18 +4008,31 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   // ---- Description panel ----
   {
+    const bool category_is_unavailable =
+        category_ == kMultiplayerCategory &&
+        !multiplayer_controls_enabled;
     const float panel_h = desc_panel_h;
     const float header_bar_h = row_h;  // header bar matches a settings row
+    const ImU32 description_header_fill =
+        category_is_unavailable ? IM_COL32(87, 94, 94, 210)
+                                : kColAccent;
+    const ImU32 description_header_text =
+        category_is_unavailable ? kColTextFaint : kColAccentDark;
     dl->AddRectFilled(ImVec2(desc_x, columns_y), ImVec2(desc_x + desc_w, columns_y + header_bar_h),
-                      kColAccent, 0.0f);
+                      description_header_fill, 0.0f);
     AddTextVCentered(dl, bold_ol, label_size, desc_x + 18.0f * s, columns_y + header_bar_h * 0.5f,
-                     kColAccentDark, "Description");
+                     description_header_text, "Description");
     dl->AddRectFilled(ImVec2(desc_x, columns_y + header_bar_h),
                       ImVec2(desc_x + desc_w, columns_y + panel_h), kColDescPanel, 0.0f);
     dl->AddRect(ImVec2(desc_x, columns_y), ImVec2(desc_x + desc_w, columns_y + panel_h),
                 kColRailBorder, 0.0f);
 
     const char* desc_text = kCategories[category_].desc;
+    if (category_is_unavailable) {
+      desc_text =
+          "Start Steam to use multiplayer. Offline and single-player play "
+          "remain fully available.";
+    }
     if (zone_ == FocusZone::kRail && rail_sel_ == quit_rail_index) {
       desc_text = "Quit to the desktop. Unsaved game progress is lost.";
     }
