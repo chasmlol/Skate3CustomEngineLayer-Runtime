@@ -2234,6 +2234,20 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.enabled = false;
         rows.push_back(std::move(row));
       }
+      if (!multiplayer_enabled) {
+        for (RowSpec& row : rows) {
+          row.enabled = false;
+        }
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Check for Steam";
+        row.desc =
+            "Check once for a running, signed-in Steam client. The game does "
+            "not start Steam or retry continuously.";
+        row.action = [this] { ReloadMultiplayer(true); };
+        rows.push_back(std::move(row));
+        break;
+      }
       if (HasCvar("skate3_multiplayer_quality_preset")) {
         header("Network Quality");
         {
@@ -2582,11 +2596,6 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
           ReloadMultiplayer(true);
         };
         rows.push_back(std::move(row));
-      }
-      if (!multiplayer_enabled) {
-        for (RowSpec& row : rows) {
-          row.enabled = false;
-        }
       }
       break;
     }
