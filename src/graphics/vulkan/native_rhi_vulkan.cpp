@@ -421,7 +421,8 @@ class NrCmdVulkan : public nrhi::Cmd {
   void SetTexturePair(uint32_t param, nrhi::TextureView* first,
                       nrhi::TextureView* second) override;
   void SetTextures(uint32_t param, nrhi::TextureView* const* views, uint32_t count) override;
-  void SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth) override;
+  void SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth,
+                        nrhi::Texture* color_1) override;
   void ClearRenderTarget(nrhi::Texture* color, const float color4[4]) override;
   void ClearDepth(nrhi::Texture* depth, float value) override;
   void SetViewport(const nrhi::Viewport& viewport) override;
@@ -1208,6 +1209,12 @@ class NrDeviceVulkan : public nrhi::Device {
     auto* vs = static_cast<NrShaderVulkan*>(desc.vs);
     auto* ps = static_cast<NrShaderVulkan*>(desc.ps);
     if (layout == nullptr || vs == nullptr || ps == nullptr) return nullptr;
+    if (desc.rtv_format_1 != Format::kUnknown) {
+      REXLOG_ERROR(
+          "nrhi-vulkan: second color attachments are unsupported by this "
+          "backend");
+      return nullptr;
+    }
     auto* pipeline = new NrPipelineVulkan();
     pipeline->vs_module = vs->module;
     pipeline->ps_module = ps->module;
@@ -2451,8 +2458,17 @@ void NrCmdVulkan::SetTextures(uint32_t param, nrhi::TextureView* const* views, u
   }
 }
 
-void NrCmdVulkan::SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth) {
+void NrCmdVulkan::SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth,
+                                   nrhi::Texture* color_1) {
   EndRenderPassIfOpen();
+  if (color_1 != nullptr) {
+    static bool second_color_attachment_logged = false;
+    if (!second_color_attachment_logged) {
+      second_color_attachment_logged = true;
+      REXLOG_ERROR(
+          "nrhi-vulkan: ignoring unsupported second color attachment");
+    }
+  }
   rt_color_ = static_cast<NrTextureVulkan*>(color);
   rt_depth_ = static_cast<NrTextureVulkan*>(depth);
 }
@@ -2712,6 +2728,8 @@ rex::perf::DrawBucket ProfileStageBucket(nrhi::ProfileStage stage) {
       return rex::perf::DrawBucket::kNativeSsr;
     case nrhi::ProfileStage::kVolumetrics:
       return rex::perf::DrawBucket::kNativeVol;
+    case nrhi::ProfileStage::kDlss:
+      return rex::perf::DrawBucket::kNativeDlss;
     case nrhi::ProfileStage::kBloom:
       return rex::perf::DrawBucket::kNativeBloom;
     case nrhi::ProfileStage::k2d:

@@ -374,7 +374,8 @@ class NrCmdD3D12 : public nrhi::Cmd {
                       nrhi::TextureView* second) override;
   void SetTextures(uint32_t param, nrhi::TextureView* const* views,
                    uint32_t count) override;
-  void SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth) override;
+  void SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth,
+                        nrhi::Texture* color_1) override;
   void ClearRenderTarget(nrhi::Texture* color, const float color4[4]) override;
   void ClearDepth(nrhi::Texture* depth, float value) override;
   void SetViewport(const nrhi::Viewport& viewport) override;
@@ -897,9 +898,23 @@ class NrDeviceD3D12 : public nrhi::Device {
       pd.InputLayout.NumElements = desc.input_element_count;
     }
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    if (desc.rtv_format_1 != Format::kUnknown &&
+        desc.rtv_format == Format::kUnknown) {
+      REXLOG_ERROR(
+          "nrhi-d3d12: second render target format requires a first render "
+          "target format");
+      return nullptr;
+    }
     if (desc.rtv_format != Format::kUnknown) {
       pd.NumRenderTargets = 1;
       pd.RTVFormats[0] = ToDxgi(desc.rtv_format);
+      if (desc.rtv_format_1 != Format::kUnknown) {
+        pd.NumRenderTargets = 2;
+        pd.RTVFormats[1] = ToDxgi(desc.rtv_format_1);
+        pd.BlendState.IndependentBlendEnable = TRUE;
+        pd.BlendState.RenderTarget[1].RenderTargetWriteMask =
+            D3D12_COLOR_WRITE_ENABLE_ALL;
+      }
     }
     if (desc.dsv_format != Format::kUnknown) {
       pd.DSVFormat = ToDxgi(desc.dsv_format);
@@ -1340,23 +1355,31 @@ void NrCmdD3D12::SetTextures(uint32_t param, nrhi::TextureView* const* views, ui
   BindTextureTable(param, typed, count);
 }
 
-void NrCmdD3D12::SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth) {
-  D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+void NrCmdD3D12::SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth,
+                                  nrhi::Texture* color_1) {
+  D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {};
   D3D12_CPU_DESCRIPTOR_HANDLE dsv;
-  const D3D12_CPU_DESCRIPTOR_HANDLE* rtv_ptr = nullptr;
   const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = nullptr;
   UINT num_rtvs = 0;
   if (color != nullptr) {
-    rtv = device->RtvHandle(static_cast<NrTextureD3D12*>(color)->rtv_slot);
-    rtv_ptr = &rtv;
-    num_rtvs = 1;
+    rtvs[num_rtvs++] =
+        device->RtvHandle(static_cast<NrTextureD3D12*>(color)->rtv_slot);
+  }
+  if (color_1 != nullptr) {
+    if (color == nullptr) {
+      REXLOG_ERROR(
+          "nrhi-d3d12: second render target requires a first render target");
+    } else {
+      rtvs[num_rtvs++] =
+          device->RtvHandle(static_cast<NrTextureD3D12*>(color_1)->rtv_slot);
+    }
   }
   if (depth != nullptr) {
     dsv = device->DsvHandle(static_cast<NrTextureD3D12*>(depth)->dsv_slot);
     dsv_ptr = &dsv;
   }
-  device->cp()->GetDeferredCommandList().D3DOMSetRenderTargets(num_rtvs, rtv_ptr, FALSE,
-                                                               dsv_ptr);
+  device->cp()->GetDeferredCommandList().D3DOMSetRenderTargets(
+      num_rtvs, num_rtvs != 0 ? rtvs : nullptr, FALSE, dsv_ptr);
 }
 
 void NrCmdD3D12::ClearRenderTarget(nrhi::Texture* color, const float color4[4]) {
@@ -1491,6 +1514,8 @@ rex::perf::DrawBucket ProfileStageBucket(nrhi::ProfileStage stage) {
       return rex::perf::DrawBucket::kNativeSsr;
     case nrhi::ProfileStage::kVolumetrics:
       return rex::perf::DrawBucket::kNativeVol;
+    case nrhi::ProfileStage::kDlss:
+      return rex::perf::DrawBucket::kNativeDlss;
     case nrhi::ProfileStage::kBloom:
       return rex::perf::DrawBucket::kNativeBloom;
     case nrhi::ProfileStage::k2d:

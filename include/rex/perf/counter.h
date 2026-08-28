@@ -74,6 +74,7 @@ enum class DrawBucket : uint8_t {
   kNativeAo,       // screen-space ambient occlusion
   kNativeSsr,      // screen-space reflection march + composite
   kNativeVol,      // volumetric sun shafts + haze
+  kNativeDlss,     // NVIDIA DLSS Super Resolution evaluate
   kNativeBloom,    // bloom pyramid + tonemap
   kNative2d,       // photo grab, blur chains, 2D overlay replay
   kNativeTail,     // after the last stage: backend/present tail
@@ -133,6 +134,8 @@ inline const char* DrawBucketName(DrawBucket bucket) {
       return "NatSSR";
     case DrawBucket::kNativeVol:
       return "NatVol";
+    case DrawBucket::kNativeDlss:
+      return "NatDLSS";
     case DrawBucket::kNativeBloom:
       return "NatBloom";
     case DrawBucket::kNative2d:

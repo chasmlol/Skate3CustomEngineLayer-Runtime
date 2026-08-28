@@ -278,6 +278,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   int frame_cap_index_ = 0;
   int aspect_ratio_index_ = 0;
   int msaa_index_ = 2;
+  int dlss_index_ = 0;
   int shadow_quality_index_ = 2;
   int static_shadow_res_index_ = 2;
   int monitor_index_ = 0;

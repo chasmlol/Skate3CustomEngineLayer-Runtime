@@ -382,6 +382,7 @@ struct GraphicsPipelineDesc {
   CullMode cull = CullMode::kNone;
   bool depth_clip = true;
   Format rtv_format = Format::kUnknown;  // kUnknown = no color target
+  Format rtv_format_1 = Format::kUnknown;  // Optional second color target (RTV slot 1)
   Format dsv_format = Format::kUnknown;  // kUnknown = no depth target
   uint32_t sample_count = 1;
 };
@@ -417,6 +418,7 @@ enum class ProfileStage : uint8_t {
   kAmbientOcclusion,
   kSsr,
   kVolumetrics,
+  kDlss,  // NVIDIA DLSS Super Resolution evaluate
   kBloom,  // bloom pyramid + tonemap
   k2d,     // photo grab, blur chains, 2D overlay replay
   kTail,   // after the last stage: backend/present tail
@@ -454,8 +456,10 @@ class Cmd {
   virtual void SetTextures(uint32_t param, TextureView* const* views,
                            uint32_t count) = 0;
 
-  // Mip 0 of each. color/depth may each be nullptr.
-  virtual void SetRenderTargets(Texture* color, Texture* depth) = 0;
+  // Mip 0 of each. color/depth may each be nullptr. color_1 is an optional
+  // second color attachment (RTV slot 1) and requires color to be non-null.
+  virtual void SetRenderTargets(Texture* color, Texture* depth,
+                                Texture* color_1 = nullptr) = 0;
   virtual void ClearRenderTarget(Texture* color, const float color4[4]) = 0;
   virtual void ClearDepth(Texture* depth, float value) = 0;
 

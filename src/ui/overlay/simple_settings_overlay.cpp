@@ -54,9 +54,10 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 32> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 33> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
+    "skate3_dlss_mode",
     "skate3_native_render_scene_shadows",
     "skate3_native_render_scene_shadow_tile",
     "skate3_native_render_scene_shadow_static_casters",
@@ -91,6 +92,8 @@ constexpr std::array<std::string_view, 32> kOptionalSimpleSettingsCvars = {
 // MSAA sample counts for the native scene renderer.
 constexpr std::array<const char*, 4> kMsaaLabels = {"Off", "2x", "4x", "8x"};
 constexpr std::array<int32_t, 4> kMsaaSamples = {1, 2, 4, 8};
+constexpr std::array<const char*, 5> kDlssLabels = {
+    "Off", "Quality", "Balanced", "Performance", "DLAA"};
 
 // Shadow quality: dynamic-shadow toggle + cascade tile resolution. The
 // game's own atlas is three 512 tiles ("Console"); tile 0 = auto (512 x
@@ -389,6 +392,13 @@ float FieldOfViewFromCvar() {
 }
 
 bool HasMsaaCvar() { return HasCvar("skate3_native_render_scene_msaa"); }
+bool HasDlssCvar() { return HasCvar("skate3_dlss_mode"); }
+
+int DlssIndexFromCvar() {
+  return HasDlssCvar()
+             ? std::clamp(rex::cvar::Query<int32_t>("skate3_dlss_mode"), 0, 4)
+             : 0;
+}
 
 int MsaaIndexFromSamples(int32_t samples) {
   int best = 0;
@@ -1061,6 +1071,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   aspect_ratio_index_ =
       HasCvar("skate3_ultrawide") && rex::cvar::Query<bool>("skate3_ultrawide") ? 1 : 0;
   msaa_index_ = MsaaIndexFromCvar();
+  dlss_index_ = DlssIndexFromCvar();
   shadow_quality_index_ = ShadowQualityIndexFromCvar();
   static_shadow_res_index_ = StaticShadowResIndexFromCvar();
   monitor_index_ = MonitorIndexFromCvar();
@@ -1168,6 +1179,7 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
          (HasCvar("skate3_ultrawide") &&
           (aspect_ratio_index_ != 0) != rex::cvar::Query<bool>("skate3_ultrawide")) ||
          (HasMsaaCvar() && msaa_index_ != MsaaIndexFromCvar()) ||
+         (HasDlssCvar() && dlss_index_ != DlssIndexFromCvar()) ||
          (HasShadowQualityCvars() && shadow_quality_index_ != ShadowQualityIndexFromCvar()) ||
          (HasStaticShadowCvars() &&
           static_shadow_res_index_ != StaticShadowResIndexFromCvar()) ||
@@ -1365,6 +1377,11 @@ void SimpleSettingsDialog::SaveVideo() {
     msaa_index_ = std::clamp(msaa_index_, 0, static_cast<int>(kMsaaSamples.size()) - 1);
     rex::cvar::SetFlagByName("skate3_native_render_scene_msaa",
                              std::to_string(kMsaaSamples[msaa_index_]));
+  }
+  if (HasDlssCvar()) {
+    dlss_index_ = std::clamp(dlss_index_, 0, 4);
+    rex::cvar::SetFlagByName("skate3_dlss_mode",
+                             std::to_string(dlss_index_));
   }
   if (HasShadowQualityCvars()) {
     shadow_quality_index_ =
@@ -1654,6 +1671,38 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] {
           msaa_index_ =
               MsaaIndexFromSamples(int32_t(CvarDefaultDouble("skate3_native_render_scene_msaa", 4.0)));
+        };
+        rows.push_back(std::move(row));
+      }
+      // The current integration is deliberately D3D12-only. Hide the
+      // control entirely on Vulkan rather than suggesting unsupported
+      // cross-backend coverage.
+      if (HasDlssCvar() && device_list_.cvar_name == "d3d12_adapter") {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "NVIDIA DLSS Super Resolution";
+        row.desc =
+            "Real NVIDIA temporal super resolution. Quality, Balanced and "
+            "Performance render below output resolution; DLAA renders at "
+            "output resolution. NVIDIA chooses the internal resolution.";
+        for (const char* label : kDlssLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &dlss_index_;
+        if (HasCvar("skate3_dlss_status")) {
+          row.desc_extra =
+              rex::cvar::Query<std::string>("skate3_dlss_status");
+        }
+        row.on_enum_change = [this](int value) {
+          dlss_index_ = std::clamp(value, 0, 4);
+          rex::cvar::SetFlagByName("skate3_dlss_mode",
+                                   std::to_string(dlss_index_));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          dlss_index_ = 0;
+          rex::cvar::SetFlagByName("skate3_dlss_mode", "0");
+          SaveSimpleSettingsConfig(config_path_);
         };
         rows.push_back(std::move(row));
       }
