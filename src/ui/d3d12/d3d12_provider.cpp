@@ -389,6 +389,33 @@ bool D3D12Provider::Initialize() {
   }
   adapter->Release();
 
+  // Streamline manual hooking requires the native D3D device to be
+  // registered immediately after creation, before a hooked factory,
+  // swapchain, or presentation interface is used. Keep this optional so a
+  // build without Streamline binaries retains the original initialization
+  // path.
+  if (HMODULE streamline = GetModuleHandleW(L"sl.interposer.dll")) {
+    using PFNSLSetD3DDevice = int32_t(WINAPI*)(void*);
+    auto sl_set_d3d_device = reinterpret_cast<PFNSLSetD3DDevice>(
+        GetProcAddress(streamline, "slSetD3DDevice"));
+    if (sl_set_d3d_device) {
+      const int32_t set_device_result = sl_set_d3d_device(device);
+      if (set_device_result == 0) {
+        constexpr GUID kStreamlineDeviceRegisteredGuid{
+            0x46e89a5a, 0xeba4, 0x4aa1,
+            {0x91, 0x42, 0x62, 0x28, 0x58, 0xb3, 0x50, 0x07}};
+        constexpr uint32_t kStreamlineDeviceRegisteredMarker = 0x534C4453u;
+        device->SetPrivateData(kStreamlineDeviceRegisteredGuid,
+                               sizeof(kStreamlineDeviceRegisteredMarker),
+                               &kStreamlineDeviceRegisteredMarker);
+        REXLOG_INFO("D3D12Provider: Streamline device registered");
+      } else {
+        REXLOG_WARN("D3D12Provider: Streamline device registration failed ({})",
+                    set_device_result);
+      }
+    }
+  }
+
   // Configure the Direct3D 12 debug info queue.
   ID3D12InfoQueue* d3d12_info_queue;
   if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&d3d12_info_queue)))) {

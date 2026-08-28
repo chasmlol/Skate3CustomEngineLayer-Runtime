@@ -510,6 +510,33 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
           REXLOG_ERROR("D3D12Presenter: Failed to create a swap chain for the HWND");
           return SurfacePaintConnectResult::kFailure;
         }
+        // A DXGI proxy such as ReShade may own CreateDXGIFactory2, bypassing
+        // Streamline's factory interception. In manual-hooking mode NVIDIA
+        // requires the presentation interface to be upgraded immediately
+        // after creation so presentCommon runs once per presented frame.
+        if (HMODULE streamline = GetModuleHandleW(L"sl.interposer.dll")) {
+          using PFNSLUpgradeInterface = int32_t(WINAPI*)(void**);
+          auto sl_upgrade_interface = reinterpret_cast<PFNSLUpgradeInterface>(
+              GetProcAddress(streamline, "slUpgradeInterface"));
+          if (sl_upgrade_interface) {
+            void* upgraded_swap_chain = swap_chain_1.Get();
+            const int32_t upgrade_result =
+                sl_upgrade_interface(&upgraded_swap_chain);
+            if (upgrade_result == 0 && upgraded_swap_chain) {
+              swap_chain_1.Detach();
+              swap_chain_1.Attach(
+                  static_cast<IDXGISwapChain1*>(upgraded_swap_chain));
+              REXLOG_INFO(
+                  "D3D12Presenter: Streamline presentation interface "
+                  "upgraded");
+            } else {
+              REXLOG_WARN(
+                  "D3D12Presenter: Streamline presentation interface upgrade "
+                  "failed ({})",
+                  upgrade_result);
+            }
+          }
+        }
         // Disable automatic Alt+Enter handling - DXGI fullscreen doesn't
         // support ALLOW_TEARING, and using custom fullscreen in ui::Win32Window
         // anyway as with Alt+Enter the menu is kept, state changes are tracked
