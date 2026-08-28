@@ -94,6 +94,7 @@ struct SimpleMapState {
   int selected_index = 0;
   std::filesystem::path maps_folder;
   std::string active_name;
+  bool vanilla_mode = false;
 };
 
 enum class SimpleWorldLightingField {

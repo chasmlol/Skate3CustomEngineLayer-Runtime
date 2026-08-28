@@ -1770,10 +1770,13 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.kind = RowSpec::kEnum;
         row.label = "NVIDIA DLSS Neural Rendering";
         row.desc =
-            "Private DLSS 5 preview post-pass after DLSS SR or DLAA and "
-            "before tonemapping and UI. Requires NVIDIA feature 1004 access.";
+            "Private DLSS 5 preview post-pass after DLAA and before "
+            "tonemapping and UI. Quality, Balanced and Performance continue "
+            "to use ordinary DLSS Super Resolution. Requires NVIDIA feature "
+            "1004 access.";
         row.options = {"Off", "On"};
         row.flag = &dlss_neural_rendering_;
+        row.enabled = dlss_index_ == 4;
         if (HasCvar("skate3_dlss_nr_status")) {
           row.desc_extra =
               rex::cvar::Query<std::string>("skate3_dlss_nr_status");
@@ -2837,13 +2840,41 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       break;
     }
     case 5: {  // Maps
+      header("Original Game");
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Vanilla Mode";
+        row.desc =
+            "Restart into Alex's original native-renderer path using Skate "
+            "3's retail University streaming, collision, GrindData and "
+            "splines. Custom-map rendering and dynamic world lighting are "
+            "disabled for this mode; graphics settings such as DLSS remain "
+            "available.";
+        row.desc_extra =
+            maps_.vanilla_mode
+                ? "Currently active."
+                : "Your saved custom renderer settings are preserved.";
+        row.action = [this] {
+          if (maps_.vanilla_mode) {
+            map_status_ = "Vanilla Mode is already active.";
+            return;
+          }
+          map_status_ = "Restarting in Vanilla Mode...";
+          if (activate_map_) {
+            activate_map_({});
+          }
+        };
+        rows.push_back(std::move(row));
+      }
+      header("Custom Maps");
       {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "Map";
         row.desc =
             "Choose an SKATE package from the dedicated Maps folder. The "
-            "currently running map is marked as active.";
+            "currently running custom map is marked as active.";
         if (maps_.maps.empty()) {
           row.options.push_back("No maps installed");
           row.enabled = false;
@@ -2863,9 +2894,9 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.kind = RowSpec::kAction;
         row.label = "Load Selected Map";
         row.desc =
-            "Load the selected map. The game session restarts automatically "
-            "so every renderer, collision, grind and physics resource is "
-            "rebuilt cleanly for the new world.";
+            "Leave Vanilla Mode and load the selected custom world. The game "
+            "session restarts so its renderer, collision, grind and physics "
+            "resources are rebuilt cleanly.";
         const SimpleMapInfo* selected_map = nullptr;
         if (!maps_.maps.empty()) {
           maps_.selected_index = std::clamp(
