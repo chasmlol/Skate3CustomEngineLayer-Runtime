@@ -54,10 +54,20 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 33> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 43> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_dlss_mode",
+    "skate3_dlss_neural_rendering",
+    "skate3_dlss_nr_intensity",
+    "skate3_dlss_nr_local_tone",
+    "skate3_dlss_nr_local_structure",
+    "skate3_dlss_nr_global_tone",
+    "skate3_dlss_nr_skin_structure",
+    "skate3_dlss_nr_auto_mask",
+    "skate3_dlss_nr_style",
+    "skate3_dlss_nr_preset",
+    "skate3_dlss_nr_performance_mode",
     "skate3_native_render_scene_shadows",
     "skate3_native_render_scene_shadow_tile",
     "skate3_native_render_scene_shadow_static_casters",
@@ -393,6 +403,10 @@ float FieldOfViewFromCvar() {
 
 bool HasMsaaCvar() { return HasCvar("skate3_native_render_scene_msaa"); }
 bool HasDlssCvar() { return HasCvar("skate3_dlss_mode"); }
+bool HasDlssNeuralCvars() {
+  return HasCvar("skate3_dlss_neural_rendering") &&
+         HasCvar("skate3_dlss_nr_intensity");
+}
 
 int DlssIndexFromCvar() {
   return HasDlssCvar()
@@ -1072,6 +1086,50 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
       HasCvar("skate3_ultrawide") && rex::cvar::Query<bool>("skate3_ultrawide") ? 1 : 0;
   msaa_index_ = MsaaIndexFromCvar();
   dlss_index_ = DlssIndexFromCvar();
+  dlss_neural_rendering_ =
+      HasDlssNeuralCvars() &&
+      rex::cvar::Query<bool>("skate3_dlss_neural_rendering");
+  dlss_neural_intensity_ =
+      HasDlssNeuralCvars()
+          ? float(rex::cvar::Query<double>("skate3_dlss_nr_intensity"))
+          : 1.0f;
+  dlss_neural_local_tone_ =
+      HasDlssNeuralCvars()
+          ? float(rex::cvar::Query<double>("skate3_dlss_nr_local_tone"))
+          : 1.0f;
+  dlss_neural_local_structure_ =
+      HasDlssNeuralCvars()
+          ? float(
+                rex::cvar::Query<double>("skate3_dlss_nr_local_structure"))
+          : 1.0f;
+  dlss_neural_global_tone_ =
+      HasDlssNeuralCvars()
+          ? float(rex::cvar::Query<double>("skate3_dlss_nr_global_tone"))
+          : 1.0f;
+  dlss_neural_skin_structure_ =
+      HasDlssNeuralCvars()
+          ? float(
+                rex::cvar::Query<double>("skate3_dlss_nr_skin_structure"))
+          : 1.0f;
+  dlss_neural_auto_mask_ =
+      HasDlssNeuralCvars() &&
+      rex::cvar::Query<bool>("skate3_dlss_nr_auto_mask");
+  dlss_neural_style_index_ =
+      HasDlssNeuralCvars()
+          ? std::clamp(
+                rex::cvar::Query<int32_t>("skate3_dlss_nr_style"), 0, 2)
+          : 0;
+  dlss_neural_preset_index_ =
+      HasDlssNeuralCvars()
+          ? std::clamp(
+                rex::cvar::Query<int32_t>("skate3_dlss_nr_preset"), 0, 3)
+          : 0;
+  dlss_neural_performance_index_ =
+      HasDlssNeuralCvars()
+          ? std::clamp(rex::cvar::Query<int32_t>(
+                           "skate3_dlss_nr_performance_mode"),
+                       0, 3)
+          : 3;
   shadow_quality_index_ = ShadowQualityIndexFromCvar();
   static_shadow_res_index_ = StaticShadowResIndexFromCvar();
   monitor_index_ = MonitorIndexFromCvar();
@@ -1705,6 +1763,136 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
           SaveSimpleSettingsConfig(config_path_);
         };
         rows.push_back(std::move(row));
+      }
+      if (HasDlssNeuralCvars() &&
+          device_list_.cvar_name == "d3d12_adapter") {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "NVIDIA DLSS Neural Rendering";
+        row.desc =
+            "Private DLSS 5 preview post-pass after DLSS SR or DLAA and "
+            "before tonemapping and UI. Requires NVIDIA feature 1004 access.";
+        row.options = {"Off", "On"};
+        row.flag = &dlss_neural_rendering_;
+        if (HasCvar("skate3_dlss_nr_status")) {
+          row.desc_extra =
+              rex::cvar::Query<std::string>("skate3_dlss_nr_status");
+        }
+        row.on_enum_change = [this](int value) {
+          dlss_neural_rendering_ = value != 0;
+          SetBoolCvar("skate3_dlss_neural_rendering",
+                      dlss_neural_rendering_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          dlss_neural_rendering_ = false;
+          SetBoolCvar("skate3_dlss_neural_rendering", false);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+
+        auto neural_slider = [this, &rows](const char* label,
+                                           const char* description,
+                                           const char* cvar, float* value) {
+          RowSpec slider;
+          slider.kind = RowSpec::kSlider;
+          slider.label = label;
+          slider.desc = description;
+          slider.value = value;
+          slider.min = 0.0f;
+          slider.max = 2.0f;
+          slider.step = 0.05f;
+          slider.fmt = "%.2f";
+          slider.on_value_change = [value, cvar] {
+            *value = std::clamp(*value, 0.0f, 2.0f);
+            rex::cvar::SetFlagByName(cvar, std::to_string(*value));
+          };
+          slider.reset = [this, value, cvar] {
+            *value = float(CvarDefaultDouble(cvar, 1.0));
+            rex::cvar::SetFlagByName(cvar, std::to_string(*value));
+            SaveSimpleSettingsConfig(config_path_);
+          };
+          rows.push_back(std::move(slider));
+        };
+        neural_slider(
+            "DLSS Neural Intensity",
+            "Overall strength from the private NVIDIA preview API.",
+            "skate3_dlss_nr_intensity", &dlss_neural_intensity_);
+        neural_slider("DLSS Neural Local Tone",
+                      "Local tone-processing strength.",
+                      "skate3_dlss_nr_local_tone",
+                      &dlss_neural_local_tone_);
+        neural_slider("DLSS Neural Local Structure",
+                      "Fine local-structure processing strength.",
+                      "skate3_dlss_nr_local_structure",
+                      &dlss_neural_local_structure_);
+        neural_slider("DLSS Neural Global Tone",
+                      "Whole-frame tone-processing strength.",
+                      "skate3_dlss_nr_global_tone",
+                      &dlss_neural_global_tone_);
+        neural_slider("DLSS Neural Skin Structure",
+                      "Skin-structure processing strength.",
+                      "skate3_dlss_nr_skin_structure",
+                      &dlss_neural_skin_structure_);
+
+        RowSpec auto_mask;
+        auto_mask.kind = RowSpec::kEnum;
+        auto_mask.label = "DLSS Neural Auto Mask";
+        auto_mask.desc = "Use the preview plugin's automatic control mask.";
+        auto_mask.options = {"Off", "On"};
+        auto_mask.flag = &dlss_neural_auto_mask_;
+        auto_mask.on_enum_change = [this](int value) {
+          dlss_neural_auto_mask_ = value != 0;
+          SetBoolCvar("skate3_dlss_nr_auto_mask",
+                      dlss_neural_auto_mask_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        auto_mask.reset = [this] {
+          dlss_neural_auto_mask_ = false;
+          SetBoolCvar("skate3_dlss_nr_auto_mask", false);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(auto_mask));
+
+        auto neural_enum = [this, &rows](const char* label,
+                                         const char* description,
+                                         const char* cvar, int* value,
+                                         int default_value,
+                                         int maximum) {
+          RowSpec setting;
+          setting.kind = RowSpec::kEnum;
+          setting.label = label;
+          setting.desc = description;
+          for (int index = 0; index <= maximum; ++index) {
+            setting.options.push_back(std::to_string(index));
+          }
+          setting.index = value;
+          setting.on_enum_change = [this, value, cvar, maximum](int index) {
+            *value = std::clamp(index, 0, maximum);
+            rex::cvar::SetFlagByName(cvar, std::to_string(*value));
+            SaveSimpleSettingsConfig(config_path_);
+          };
+          setting.reset = [this, value, cvar, default_value] {
+            *value = default_value;
+            rex::cvar::SetFlagByName(cvar, std::to_string(*value));
+            SaveSimpleSettingsConfig(config_path_);
+          };
+          rows.push_back(std::move(setting));
+        };
+        neural_enum("DLSS Neural Style",
+                    "Private preview style enum; labels are not documented "
+                    "in the supplied SDK.",
+                    "skate3_dlss_nr_style", &dlss_neural_style_index_, 0, 2);
+        neural_enum("DLSS Neural Preset",
+                    "Private preview preset enum; labels are not documented "
+                    "in the supplied SDK.",
+                    "skate3_dlss_nr_preset", &dlss_neural_preset_index_, 0, 3);
+        neural_enum(
+            "DLSS Neural Performance Mode",
+            "Private preview performance enum; labels are not documented "
+            "in the supplied SDK.",
+            "skate3_dlss_nr_performance_mode",
+            &dlss_neural_performance_index_, 3, 3);
       }
       if (HasShadowQualityCvars()) {
         RowSpec row;
